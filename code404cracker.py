@@ -54,6 +54,9 @@ def decode_base64(s: str) -> str | None:
         s += "=" * (4 - padding)
     try:
         decoded = base64.b64decode(s, validate=True)
+        img_msg = _inspect_bytes(decoded)
+        if img_msg:
+            return img_msg
         result = decoded.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -78,6 +81,9 @@ def decode_base32(s: str) -> str | None:
         s += "=" * (8 - padding)
     try:
         decoded = base64.b32decode(s)
+        img_msg = _inspect_bytes(decoded)
+        if img_msg:
+            return img_msg
         result = decoded.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -96,6 +102,9 @@ def decode_base85(s: str) -> str | None:
         return None
     try:
         decoded = base64.b85decode(s)
+        img_msg = _inspect_bytes(decoded)
+        if img_msg:
+            return img_msg
         result = decoded.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -104,6 +113,9 @@ def decode_base85(s: str) -> str | None:
         pass
     try:
         decoded = base64.a85decode(s, ignorechars=b" \t\n\r\v")
+        img_msg = _inspect_bytes(decoded)
+        if img_msg:
+            return img_msg
         result = decoded.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -128,6 +140,9 @@ def decode_hex(s: str) -> str | None:
         return None
     try:
         decoded = bytes.fromhex(s)
+        img_msg = _inspect_bytes(decoded)
+        if img_msg:
+            return img_msg
         result = decoded.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -141,24 +156,39 @@ def decode_hex(s: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def decode_binary(s: str) -> str | None:
-    s = _clean(s).replace(" ", "")
+    cleaned = _clean(s)
     # Accept groups of 8 bits separated by spaces or nothing
-    if " " in _clean(s):
-        parts = _clean(s).split()
+    if " " in cleaned:
+        parts = cleaned.split()
     else:
-        parts = [s[i:i+8] for i in range(0, len(s), 8)]
+        compact = cleaned.replace(" ", "")
+        parts = [compact[i:i+8] for i in range(0, len(compact), 8)]
     if not parts:
         return None
     if not all(re.fullmatch(r'[01]{8}', p) for p in parts):
         return None
     try:
-        chars = [chr(int(p, 2)) for p in parts]
-        result = "".join(chars)
-        if _is_printable(result):
-            return result
-        return None
+        data = bytes(int(p, 2) for p in parts)
     except Exception:
         return None
+
+    # Image check FIRST — binary frequently hides images (CTF classic)
+    img_msg = _inspect_bytes(data)
+    if img_msg:
+        return img_msg
+
+    result = data.decode("utf-8", errors="replace")
+    if _is_printable(result):
+        return result
+
+    # Not text and not an image — show a hex preview so the user sees
+    # SOMETHING instead of a blank output
+    if data:
+        preview = data[:64].hex(" ")
+        if len(data) > 64:
+            preview += " ..."
+        return f"[binary decoded to {len(data)} bytes of non-text data]\nHEX PREVIEW: {preview}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +369,13 @@ def decode_ascii(s: str) -> str | None:
     if not parts:
         return None
     try:
-        chars = [chr(int(p)) for p in parts]
+        values = [int(p) for p in parts]
+        if all(0 <= v <= 255 for v in values):
+            data = bytes(values)
+            img_msg = _inspect_bytes(data)
+            if img_msg:
+                return img_msg
+        chars = [chr(v) for v in values]
         result = "".join(chars)
         if _is_printable(result):
             return result
@@ -360,7 +396,13 @@ def decode_octal(s: str) -> str | None:
     if not parts:
         return None
     try:
-        chars = [chr(int(p, 8)) for p in parts]
+        values = [int(p, 8) for p in parts]
+        if all(0 <= v <= 255 for v in values):
+            data = bytes(values)
+            img_msg = _inspect_bytes(data)
+            if img_msg:
+                return img_msg
+        chars = [chr(v) for v in values]
         result = "".join(chars)
         if _is_printable(result):
             return result
@@ -520,6 +562,9 @@ def decode_base58(s: str) -> str | None:
             else:
                 break
         result_bytes = b"\x00" * leading_zeros + result_bytes
+        img_msg = _inspect_bytes(result_bytes)
+        if img_msg:
+            return img_msg
         result = result_bytes.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -551,6 +596,9 @@ def decode_base62(s: str) -> str | None:
         for c in s:
             num = num * 62 + BASE62_INDEX[c]
         result_bytes = num.to_bytes((num.bit_length() + 7) // 8, byteorder="big")
+        img_msg = _inspect_bytes(result_bytes)
+        if img_msg:
+            return img_msg
         result = result_bytes.decode("utf-8", errors="replace")
         if _is_printable(result):
             return result
@@ -1053,7 +1101,263 @@ IMAGE_SIGNATURES = {
     b"GIF8": ".gif",
     b"BM": ".bmp",
     b"RIFF": ".webp",
+    b"II*\x00": ".tiff",
+    b"MM\x00*": ".tiff",
 }
+
+
+def _save_image_bytes(decoded_bytes: bytes) -> str | None:
+    """If the decoded bytes are a known image format, save the image,
+    open it, and return a status message. Returns None if not an image.
+
+    Used by Base64, Binary, Hex, Base32, Base58, Base62, ASCII and Octal
+    decoders — so an image hidden in ANY encoding is detected, not just Base64.
+    """
+    if not decoded_bytes or len(decoded_bytes) < 8:
+        return None
+    image_ext = None
+    for sig, ext in IMAGE_SIGNATURES.items():
+        if decoded_bytes.startswith(sig):
+            image_ext = ext
+            break
+    if image_ext is None:
+        return None
+
+    import subprocess, platform
+    if platform.system() == "Linux":
+        save_path = f"/tmp/404codecracker_image{image_ext}"
+    else:
+        save_path = os.path.join(os.path.expanduser("~"), f"404codecracker_image{image_ext}")
+
+    try:
+        with open(save_path, "wb") as f:
+            f.write(decoded_bytes)
+    except Exception as e:
+        return f"IMAGE DETECTED ({image_ext}) but could not save: {e}"
+
+    try:
+        if platform.system() == "Linux":
+            subprocess.Popen(["xdg-open", save_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif platform.system() == "Windows":
+            os.startfile(save_path)
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", save_path],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    return f"IMAGE DETECTED! Saved to: {save_path} - Image opened! Check it!"
+
+
+def _text_to_bytes(s: str):
+    """Best-effort conversion of pasted text (hex / base64 / raw) to bytes."""
+    if not s:
+        return None
+    t = s.strip()
+    # hex (spaces/newlines allowed)
+    h = re.sub(r'\s+', '', t)
+    if len(h) >= 8 and len(h) % 2 == 0 and re.fullmatch(r'[0-9a-fA-F]+', h):
+        try:
+            return bytes.fromhex(h)
+        except Exception:
+            pass
+    # base64
+    try:
+        b = re.sub(r'\s+', '', t)
+        b += "=" * ((4 - len(b) % 4) % 4)
+        return base64.b64decode(b, validate=True)
+    except Exception:
+        pass
+    # raw latin-1
+    try:
+        return t.encode('latin-1')
+    except Exception:
+        return None
+
+
+def _decompress_bytes(data: bytes):
+    """If bytes are gzip/zlib/bzip2, decompress to text. Else None."""
+    if not data:
+        return None
+    if data[:2] == b'\x1f\x8b':
+        try:
+            import gzip
+            return gzip.decompress(data).decode('utf-8', errors='replace')
+        except Exception:
+            pass
+    if len(data) > 2 and data[0] == 0x78 and data[1] in (0x01, 0x5e, 0x9c, 0xda):
+        try:
+            import zlib
+            return zlib.decompress(data).decode('utf-8', errors='replace')
+        except Exception:
+            pass
+    if data[:3] == b'BZh':
+        try:
+            import bz2
+            return bz2.decompress(data).decode('utf-8', errors='replace')
+        except Exception:
+            pass
+    return None
+
+
+def _inspect_bytes(data: bytes):
+    """Check decoded bytes for image or compressed data.
+    Returns a message / decompressed text if recognised, else None."""
+    img = _save_image_bytes(data)
+    if img:
+        return img
+    return _decompress_bytes(data)
+
+
+# ===========================================================================
+# COMPRESSION DECODERS (gzip / zlib / bzip2)
+# ===========================================================================
+
+def decode_gzip(s: str) -> str | None:
+    data = _text_to_bytes(s)
+    if not data or data[:2] != b'\x1f\x8b':
+        return None
+    try:
+        import gzip
+        return gzip.decompress(data).decode('utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def decode_zlib(s: str) -> str | None:
+    data = _text_to_bytes(s)
+    if not data or len(data) < 3:
+        return None
+    if not (data[0] == 0x78 and data[1] in (0x01, 0x5e, 0x9c, 0xda)):
+        return None
+    try:
+        import zlib
+        return zlib.decompress(data).decode('utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def decode_bzip2(s: str) -> str | None:
+    data = _text_to_bytes(s)
+    if not data or data[:3] != b'BZh':
+        return None
+    try:
+        import bz2
+        return bz2.decompress(data).decode('utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+# ===========================================================================
+# CHARACTER-SET DECODERS (UTF-16 / Latin-1 mojibake)
+# ===========================================================================
+
+def decode_utf16(s: str) -> str | None:
+    """Decode UTF-16 text given as hex/base64/raw bytes."""
+    data = _text_to_bytes(s)
+    if not data or len(data) < 2:
+        return None
+    try:
+        if data[:2] == b'\xff\xfe':
+            return data[2:].decode('utf-16-le')
+        if data[:2] == b'\xfe\xff':
+            return data[2:].decode('utf-16-be')
+    except Exception:
+        return None
+    # No BOM — guess LE/BE when there are many NUL bytes
+    if len(data) >= 4 and data.count(b'\x00') >= len(data) // 4:
+        for enc in ('utf-16-le', 'utf-16-be'):
+            try:
+                out = data.decode(enc)
+                if _is_printable(out):
+                    return out
+            except Exception:
+                continue
+    return None
+
+
+def decode_mojibake(s: str) -> str | None:
+    """Fix Latin-1 mojibake: 'cafÃ©' -> 'café'."""
+    s = _clean(s)
+    if not s:
+        return None
+    try:
+        fixed = s.encode('latin-1').decode('utf-8')
+    except Exception:
+        return None
+    if fixed != s and fixed.isprintable():
+        return fixed
+    return None
+
+
+# ===========================================================================
+# COMPRESSION ENCODERS
+# ===========================================================================
+
+def encode_gzip_hex(s: str) -> str:
+    import gzip
+    return gzip.compress(s.encode('utf-8')).hex()
+
+
+def encode_zlib_hex(s: str) -> str:
+    import zlib
+    return zlib.compress(s.encode('utf-8')).hex()
+
+
+# ===========================================================================
+# TEXT / DATA TOOLS (JSON, XML, entropy, HMAC)
+# ===========================================================================
+
+def beautify_json(s: str) -> str:
+    import json as _json
+    try:
+        return _json.dumps(_json.loads(s), indent=2, ensure_ascii=False)
+    except Exception as e:
+        return f"Invalid JSON: {e}"
+
+
+def beautify_xml(s: str) -> str:
+    import xml.dom.minidom
+    try:
+        return xml.dom.minidom.parseString(s.strip()).toprettyxml(indent="  ")
+    except Exception as e:
+        return f"Invalid XML: {e}"
+
+
+def shannon_entropy(s: str) -> float:
+    if not s:
+        return 0.0
+    freq = {}
+    for ch in s:
+        freq[ch] = freq.get(ch, 0) + 1
+    n = len(s)
+    return -sum((v / n) * math.log2(v / n) for v in freq.values())
+
+
+def entropy_report(s: str) -> str:
+    e = shannon_entropy(s)
+    lines = [f"Entropy : {e:.4f} bits per character",
+             f"Length  : {len(s)} characters"]
+    if e < 3.0:
+        lines.append("Verdict : Low entropy — plain text or simple encoding")
+    elif e < 4.5:
+        lines.append("Verdict : Medium entropy — typical encoded text")
+    elif e < 6.5:
+        lines.append("Verdict : High entropy — possibly compressed data")
+    else:
+        lines.append("Verdict : Very high entropy — likely encrypted or random")
+    return "\n".join(lines)
+
+
+def compute_hmac(s: str, key: str, algo: str = 'sha256') -> str:
+    import hmac, hashlib
+    try:
+        return hmac.new(key.encode('utf-8'), s.encode('utf-8'),
+                        getattr(hashlib, algo)).hexdigest()
+    except Exception as e:
+        return f"HMAC error: {e}"
+
 
 def decode_base64_image(s: str) -> str | None:
     """Check if Base64 decodes to an image. If yes, save and open it."""
@@ -1070,36 +1374,7 @@ def decode_base64_image(s: str) -> str | None:
         decoded_bytes = base64.b64decode(s, validate=True)
     except Exception:
         return None
-
-    image_ext = None
-    for sig, ext in IMAGE_SIGNATURES.items():
-        if decoded_bytes.startswith(sig):
-            image_ext = ext
-            break
-
-    if image_ext is None:
-        return None
-
-    import tempfile, subprocess, platform
-    if platform.system() == "Linux":
-        save_path = f"/tmp/404codecracker_image{image_ext}"
-    else:
-        save_path = os.path.join(os.path.expanduser("~"), f"404codecracker_image{image_ext}")
-
-    with open(save_path, "wb") as f:
-        f.write(decoded_bytes)
-
-    try:
-        if platform.system() == "Linux":
-            subprocess.Popen(["xdg-open", save_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        elif platform.system() == "Windows":
-            os.startfile(save_path)
-        elif platform.system() == "Darwin":
-            subprocess.Popen(["open", save_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
-
-    return f"IMAGE DETECTED! Saved to: {save_path} - Image opened! Check it!"
+    return _save_image_bytes(decoded_bytes)
 
 
 # ===========================================================================
@@ -2223,18 +2498,43 @@ def aes_decrypt(data_hex, key_hex, iv_hex=''):
         from Crypto.Cipher import AES
         from Crypto.Util.Padding import unpad
     except ImportError:
-        return "AES decryption requires pycryptodome: pip install pycryptodome"
+        return ("AES needs pycryptodome. Install with:\n"
+                "  pip3 install --break-system-packages pycryptodome")
     try:
         data = bytes.fromhex(data_hex.replace(' ', ''))
         key = bytes.fromhex(key_hex.replace(' ', ''))
-        iv = bytes.fromhex(iv_hex.replace(' ', '')) if iv_hex else b'\x00' * 16
         if len(key) not in (16, 24, 32):
-            return "Key must be 16, 24, or 32 bytes (32, 48, or 64 hex chars)"
-        if len(iv) != 16:
-            return "IV must be 16 bytes (32 hex chars)"
-        cipher = AES.new(key, AES.MODE_CBC, iv)
-        decrypted = unpad(cipher.decrypt(data), AES.block_size)
-        return decrypted.decode('utf-8', errors='replace')
+            return "Key must be 16, 24 or 32 bytes (32, 48 or 64 hex chars)"
+
+        # Build the list of modes to try
+        if iv_hex and iv_hex.strip():
+            iv = bytes.fromhex(iv_hex.replace(' ', ''))
+            if len(iv) != 16:
+                return "IV must be 16 bytes (32 hex chars)"
+            modes = [("CBC", AES.MODE_CBC, iv)]
+        else:
+            modes = [("ECB", AES.MODE_ECB, None),
+                     ("CBC (zero IV)", AES.MODE_CBC, b'\x00' * 16)]
+
+        last_err = None
+        last_text = None
+        for label, mode, iv in modes:
+            try:
+                cipher = AES.new(key, mode) if iv is None else AES.new(key, mode, iv)
+                dec = cipher.decrypt(data)
+                try:
+                    dec = unpad(dec, AES.block_size)
+                except Exception:
+                    pass  # no padding — use raw
+                text = dec.decode('utf-8', errors='replace')
+                last_text = text
+                if _is_printable(text):
+                    return f"[{label}] {text}"
+            except Exception as e:
+                last_err = e
+        if last_text is not None:
+            return f"[raw] {last_text}"
+        return f"AES decryption error: {last_err}"
     except Exception as e:
         return f"AES decryption error: {e}"
 
@@ -3023,6 +3323,12 @@ DECODERS = {
     "Malbolge": decode_malbolge,
     "ROT8000": decode_rot8000,
     "JSFuck": decode_jsfuck,
+    # --- v3.3 additions: compression + character sets ---
+    "Gzip": decode_gzip,
+    "Zlib": decode_zlib,
+    "Bzip2": decode_bzip2,
+    "UTF-16": decode_utf16,
+    "Mojibake Fix": decode_mojibake,
 }
 
 
@@ -3066,6 +3372,11 @@ DECODER_PRIORITY = {
     "ROT8000": 35,
     "JSFuck": 36,
     "Brainfuck": 25,
+    "Gzip": 3,
+    "Zlib": 4,
+    "Bzip2": 5,
+    "UTF-16": 6,
+    "Mojibake Fix": 45,
 }
 
 # Input pattern signatures — if the input matches one of these,
@@ -3093,6 +3404,11 @@ INPUT_PATTERNS = {
     "A1Z26": re.compile(r'^([1-9]|1[0-9]|2[0-6])(\s+([1-9]|1[0-9]|2[0-6]))+$'),
     "Polybius Square": re.compile(r'^[1-5][1-5]( [1-5][1-5])+$'),
     "BCD": re.compile(r'^[01]{4}( [01]{4})*$'),
+    # --- v3.3 patterns ---
+    "Gzip": re.compile(r'^(1f8b|H4sI)', re.IGNORECASE),
+    "Zlib": re.compile(r'^(789[cd]|eJ)', re.IGNORECASE),
+    "Bzip2": re.compile(r'^(425a68|Qlpo)', re.IGNORECASE),
+    "UTF-16": re.compile(r'^(fffe|feff)', re.IGNORECASE),
 }
 
 
@@ -3535,10 +3851,21 @@ def process_image(image_path: str) -> dict:
 
 
 def is_image_file(filepath: str) -> bool:
-    """Check if a file is a supported image type."""
+    """Check if a file is a supported image type — by extension OR magic bytes
+    (so a .bin file that is actually an image is still detected)."""
     ext = os.path.splitext(filepath)[1].lower()
     supported = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
-    return ext in supported
+    if ext in supported:
+        return True
+    try:
+        with open(filepath, "rb") as f:
+            head = f.read(16)
+        for sig in IMAGE_SIGNATURES:
+            if head.startswith(sig):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # Common CTF flag patterns
@@ -3827,7 +4154,7 @@ class Code404CrackerGUI:
 
         ver = tk.Label(
             header,
-            text="v3.0",
+            text="v3.3",
             font=FONT_SUBTITLE,
             bg=BG_HEADER, fg=CYAN
         )
@@ -4260,6 +4587,21 @@ class Code404CrackerGUI:
                   padx=12, pady=6, activebackground=BG_BTN_HOV,
                   command=self._copy_tools_output).pack(side=tk.RIGHT)
 
+        # Second row: data & text tools (v3.3)
+        btn_bar2 = tk.Frame(parent, bg=BG)
+        btn_bar2.pack(fill=tk.X, padx=10, pady=(0, 4))
+
+        for label, cmd in [
+            ("Beautify JSON", self._do_beautify_json),
+            ("Beautify XML", self._do_beautify_xml),
+            ("Entropy", self._do_entropy),
+            ("HMAC", self._do_hmac),
+        ]:
+            tk.Button(btn_bar2, text=label,
+                      font=FONT_BTN, bg=BG_BTN, fg=PURPLE, relief=tk.FLAT,
+                      padx=10, pady=5, activebackground=BG_BTN_HOV,
+                      command=cmd).pack(side=tk.LEFT, padx=(0, 5))
+
         # Input
         tk.Label(parent, text="┌─[ INPUT ] paste text for analysis here",
                 font=FONT_LABEL, bg=BG, fg=AMBER).pack(anchor=tk.W, padx=10, pady=(4, 2))
@@ -4353,6 +4695,54 @@ class Code404CrackerGUI:
         self.tools_output.insert(tk.END, "Match the most frequent letter in ciphertext to E.\n", "t_note")
         self.tools_output.configure(state=tk.DISABLED)
         self._set_status("frequency analysis done")
+
+    def _tools_write(self, text, tag="t_result"):
+        """Helper: write text into the TOOLS output box."""
+        self.tools_output.configure(state=tk.NORMAL)
+        self.tools_output.delete("1.0", tk.END)
+        self.tools_output.insert(tk.END, text, tag)
+        self.tools_output.configure(state=tk.DISABLED)
+
+    def _do_beautify_json(self):
+        raw = self.tools_input.get("1.0", tk.END).strip()
+        if not raw:
+            messagebox.showwarning("Empty", "Please paste some JSON first.")
+            return
+        self._set_status("formatting JSON...")
+        self._tools_write(beautify_json(raw))
+        self._set_status("JSON formatted")
+
+    def _do_beautify_xml(self):
+        raw = self.tools_input.get("1.0", tk.END).strip()
+        if not raw:
+            messagebox.showwarning("Empty", "Please paste some XML first.")
+            return
+        self._set_status("formatting XML...")
+        self._tools_write(beautify_xml(raw))
+        self._set_status("XML formatted")
+
+    def _do_entropy(self):
+        raw = self.tools_input.get("1.0", tk.END).strip()
+        if not raw:
+            messagebox.showwarning("Empty", "Please paste some text first.")
+            return
+        self._tools_write(entropy_report(raw))
+        self._set_status("entropy calculated")
+
+    def _do_hmac(self):
+        raw = self.tools_input.get("1.0", tk.END).strip()
+        if not raw:
+            messagebox.showwarning("Empty", "Please paste some text first.")
+            return
+        key = simpledialog.askstring("HMAC Key", "Enter the secret key:",
+                                     parent=self.root)
+        if key is None:
+            return
+        lines = []
+        for algo in ("md5", "sha1", "sha256", "sha512"):
+            lines.append(f"{algo.upper():6s}: {compute_hmac(raw, key, algo)}")
+        self._tools_write("\n".join(lines))
+        self._set_status("HMAC computed")
 
     def _copy_tools_output(self):
         content = self.tools_output.get("1.0", tk.END)
@@ -5311,17 +5701,54 @@ class Code404CrackerGUI:
 
     def _load_text_file(self):
         path = filedialog.askopenfilename(
-            title="Select a text file",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+            title="Select a file (text, .bin, .dat, hex, or image)",
+            filetypes=[
+                ("All supported files",
+                 "*.txt *.bin *.dat *.hex *.log *.csv *.json *.xml *.md *.py *.js *.html *.htm *.sh *.png *.jpg *.jpeg *.gif *.bmp *.webp *.tiff"),
+                ("Binary files", "*.bin *.dat *.hex"),
+                ("Text files", "*.txt *.log *.csv *.json *.xml *.md *.py *.js *.html *.htm *.sh"),
+                ("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tiff"),
+                ("All files", "*.*"),
+            ]
         )
-        if path:
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+
+            # 1. If the file itself is an image (even a .bin one) — scan it
+            if is_image_file(path):
+                self._process_image(path)
+                return
+
+            # 2. Try to read it as text
+            text = None
             try:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
-                    self.input_text.delete("1.0", tk.END)
-                    self.input_text.insert("1.0", f.read())
-                self._set_status(f"loaded: {os.path.basename(path)}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not read file:\n{e}")
+                text = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                text = None
+
+            # 3. Decide: real text vs binary
+            looks_text = False
+            if text is not None and text:
+                sample = text[:2000]
+                printable = sum(1 for c in sample if c.isprintable() or c in "\n\r\t")
+                looks_text = (printable / len(sample)) > 0.85
+
+            self.input_text.delete("1.0", tk.END)
+            if looks_text:
+                self.input_text.insert("1.0", text)
+                self._set_status(f"loaded: {os.path.basename(path)} ({len(raw)} bytes)")
+            elif raw:
+                # Binary file — show a hex dump so nothing is lost
+                self.input_text.insert("1.0", hex_dump(raw))
+                self._set_status(
+                    f"loaded binary: {os.path.basename(path)} ({len(raw)} bytes) — shown as hex")
+            else:
+                self._set_status(f"file is empty: {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read file:\n{e}")
 
     def _load_image_file(self):
         path = filedialog.askopenfilename(
@@ -5952,6 +6379,9 @@ ENCODERS = {
     "Polybius Square": encode_polybius,
     "Beaufort Cipher": encode_beaufort,
     "Deadfish": encode_deadfish,
+    # --- v3.3 additions ---
+    "Gzip (hex)": encode_gzip_hex,
+    "Zlib (hex)": encode_zlib_hex,
 }
 
 
@@ -6016,9 +6446,9 @@ def frequency_analysis(s: str) -> dict:
 
 BANNER = r"""
   ╔══════════════════════════════════════════════╗
-  ║  404 CODE CRACKER v3.0                       ║
+  ║  404 CODE CRACKER v3.3                       ║
   ║  Auto-detect | Decode | Encode | Crack       ║
-  ║  70+ Tools | 11 Tabs | Created by ERROR 404  ║
+  ║  Images + gzip + AES + JSON | 11 Tabs        ║
   ╚══════════════════════════════════════════════╝
 """
 
